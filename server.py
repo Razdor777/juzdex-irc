@@ -1,13 +1,9 @@
-import asyncio
+from aiohttp import web
+import aiohttp
 import json
 import time
+import asyncio
 import os
-
-try:
-    import websockets
-    from websockets.legacy.server import WebSocketServerProtocol
-except ImportError:
-    import websockets
 
 class OpCode:
     Work = 0
@@ -44,20 +40,20 @@ def make_op(opcode, data, success=True):
 
 async def send_op(ws, opcode, data, success=True):
     try:
-        await ws.send(make_op(opcode, data, success))
+        await ws.send_str(make_op(opcode, data, success))
     except:
         pass
 
-async def broadcast(opcode, data, exclude=None):
-    for ws, client in list(clients.items()):
-        if ws == exclude or not client.authenticated:
+async def broadcast(opcode, data, exclude_id=None):
+    for cid, client in list(clients.items()):
+        if cid == exclude_id or not client.authenticated:
             continue
-        await send_op(ws, opcode, data)
+        await send_op(client.ws, opcode, data)
 
 async def broadcast_user_list():
     user_list = {}
     i = 0
-    for ws, client in clients.items():
+    for cid, client in clients.items():
         if not client.authenticated:
             continue
         user_list[str(i)] = {
@@ -68,126 +64,145 @@ async def broadcast_user_list():
         }
         i += 1
     data = json.dumps(user_list)
-    for ws, client in list(clients.items()):
+    for cid, client in list(clients.items()):
         if client.authenticated:
-            await send_op(ws, OpCode.ConnectedUserList, data)
+            await send_op(client.ws, OpCode.ConnectedUserList, data)
 
-async def ping_loop():
-    while True:
-        await asyncio.sleep(5)
-        for ws, client in list(clients.items()):
-            if client.authenticated:
-                try:
-                    await send_op(ws, OpCode.Ping, str(int(time.time() * 1000)))
-                except:
-                    pass
+async def ping_loop(app):
+    try:
+        while True:
+            await asyncio.sleep(5)
+            for cid, client in list(clients.items()):
+                if client.authenticated:
+                    try:
+                        await send_op(client.ws, OpCode.Ping, str(int(time.time() * 1000)))
+                    except:
+                        pass
+    except asyncio.CancelledError:
+        pass
 
-async def handle_client(ws, path=None):
+async def handle_root(request):
+    if request.headers.get('Upgrade', '').lower() == 'websocket':
+        return await handle_websocket(request)
+    return web.Response(text="OK")
+
+async def handle_health(request):
+    count = sum(1 for c in clients.values() if c.authenticated)
+    return web.Response(text=f"OK - {count} users online")
+
+async def handle_websocket(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+
+    cid = id(ws)
     client = Client(ws)
-    clients[ws] = client
+    clients[cid] = client
     print(f"[+] New connection")
 
     try:
         await send_op(ws, OpCode.Work, "1")
 
-        async for raw_message in ws:
-            try:
-                data = json.loads(raw_message)
-                opcode = data.get("o", -1)
-                op_data = data.get("d", "")
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                try:
+                    data = json.loads(msg.data)
+                    opcode = data.get("o", -1)
+                    op_data = data.get("d", "")
 
-                if opcode == OpCode.CompleteWork and not client.authenticated:
-                    await send_op(ws, OpCode.AuthFinish, "OK")
-                    client.authenticated = True
-                    print(f"[+] Client authenticated")
-                    continue
-
-                if opcode == OpCode.KeyIn:
-                    continue
-
-                if opcode == OpCode.IdentifyClient:
-                    try:
-                        info = json.loads(op_data)
-                        client.client_name = info.get("0", "unknown")
-                    except:
-                        pass
-                    continue
-
-                if opcode == OpCode.IdentifyPlayer:
-                    try:
-                        info = json.loads(op_data)
-                        old_name = client.username
-                        client.username = info.get("0", "unknown")
-                        client.player_name = info.get("1", "unknown")
-                        client.xuid = info.get("2", "")
-                        print(f"[*] Player: {client.player_name} ({client.username})")
-                        if not old_name:
-                            msg = f"\u00a7a{client.username} ({client.player_name}) joined IRC"
-                            await broadcast(OpCode.Join, msg)
-                            await broadcast_user_list()
-                    except:
-                        pass
-                    continue
-
-                if opcode == OpCode.IdentifySkinData:
-                    continue
-
-                if opcode == OpCode.Message:
-                    if not client.authenticated:
+                    if opcode == OpCode.CompleteWork and not client.authenticated:
+                        await send_op(ws, OpCode.AuthFinish, "OK")
+                        client.authenticated = True
+                        print(f"[+] Client authenticated")
                         continue
-                    msg_text = f"\u00a7b{client.username}\u00a7f ({client.player_name}): {op_data}"
-                    print(f"[MSG] {client.username}: {op_data}")
-                    await broadcast(OpCode.Message, msg_text)
-                    continue
 
-                if opcode == OpCode.ListUsers:
-                    await broadcast_user_list()
-                    continue
+                    if opcode == OpCode.KeyIn:
+                        continue
 
-                if opcode == OpCode.Ping:
-                    continue
+                    if opcode == OpCode.IdentifyClient:
+                        try:
+                            info = json.loads(op_data)
+                            client.client_name = info.get("0", "unknown")
+                        except:
+                            pass
+                        continue
 
-            except json.JSONDecodeError:
-                pass
-            except Exception as e:
-                print(f"[!] Error: {e}")
+                    if opcode == OpCode.IdentifyPlayer:
+                        try:
+                            info = json.loads(op_data)
+                            old_name = client.username
+                            client.username = info.get("0", "unknown")
+                            client.player_name = info.get("1", "unknown")
+                            client.xuid = info.get("2", "")
+                            print(f"[*] Player: {client.player_name} ({client.username})")
+                            if not old_name:
+                                join_msg = f"\u00a7a{client.username} ({client.player_name}) joined IRC"
+                                await broadcast(OpCode.Join, join_msg)
+                                await broadcast_user_list()
+                        except:
+                            pass
+                        continue
 
-    except websockets.exceptions.ConnectionClosed:
-        pass
+                    if opcode == OpCode.IdentifySkinData:
+                        continue
+
+                    if opcode == OpCode.Message:
+                        if not client.authenticated:
+                            continue
+                        msg_text = f"\u00a7b{client.username}\u00a7f ({client.player_name}): {op_data}"
+                        print(f"[MSG] {client.username}: {op_data}")
+                        await broadcast(OpCode.Message, msg_text)
+                        continue
+
+                    if opcode == OpCode.ListUsers:
+                        await broadcast_user_list()
+                        continue
+
+                    if opcode == OpCode.Ping:
+                        continue
+
+                except json.JSONDecodeError:
+                    pass
+                except Exception as e:
+                    print(f"[!] Error: {e}")
+
+            elif msg.type == aiohttp.WSMsgType.ERROR:
+                print(f"[!] WebSocket error: {ws.exception()}")
+                break
+
     except Exception as e:
         print(f"[!] Error: {e}")
     finally:
         if client.authenticated and client.username:
-            msg = f"\u00a7c{client.username} ({client.player_name}) left IRC"
-            if ws in clients:
-                del clients[ws]
-            await broadcast(OpCode.Leave, msg)
+            leave_msg = f"\u00a7c{client.username} ({client.player_name}) left IRC"
+            if cid in clients:
+                del clients[cid]
+            await broadcast(OpCode.Leave, leave_msg)
             await broadcast_user_list()
             print(f"[-] {client.username} disconnected")
         else:
-            if ws in clients:
-                del clients[ws]
+            if cid in clients:
+                del clients[cid]
 
-async def health_check(path, headers):
-    if path == "/" or path == "/health":
-        return (200, [], b"OK")
+    return ws
 
-async def main():
-    port = int(os.environ.get("PORT", 33651))
-    print(f"=== Solstice IRC Server ===")
-    print(f"Starting on port {port}")
+async def start_background(app):
+    app['ping_task'] = asyncio.create_task(ping_loop(app))
 
-    asyncio.create_task(ping_loop())
-
+async def stop_background(app):
+    app['ping_task'].cancel()
     try:
-        async with websockets.serve(
-            handle_client, "0.0.0.0", port,
-            process_request=health_check
-        ):
-            await asyncio.Future()
-    except TypeError:
-        async with websockets.serve(handle_client, "0.0.0.0", port):
-            await asyncio.Future()
+        await app['ping_task']
+    except asyncio.CancelledError:
+        pass
 
-if __name__ == "__main__":
-    asyncio.run(main())
+app = web.Application()
+app.router.add_get('/', handle_root)
+app.router.add_get('/health', handle_health)
+app.on_startup.append(start_background)
+app.on_cleanup.append(stop_background)
+
+port = int(os.environ.get("PORT", 33651))
+print(f"=== Solstice IRC Server ===")
+print(f"Starting on port {port}")
+print(f"Waiting for connections...")
+web.run_app(app, host="0.0.0.0", port=port, print=None)
